@@ -78,6 +78,15 @@ co.eci.snake
   - **Colecciones** o estructuras **no seguras** en contexto concurrente.
   - Ocurrencias de **espera activa** (busy-wait) o de sincronización innecesaria.
 
+El juego corre sobre tres familias de hilos que comparten el mismo estado mutable. 
+El EDT de Swing ejecuta el constructor de SnakeApp, el dibujado (paintComponent) y los listeners de teclado,
+que llaman snake.turn() directamente. N hilos virtuales (Executors.newVirtualThreadPerTaskExecutor(),
+con -Dsnakes=N) ejecutan un SnakeRunner cada uno: 
+un bucle propio de decidir giro → board.step(snake) → dormir (80 ms, 40 ms en turbo). 
+La autonomía de cada serpiente consiste en que cada una tiene su propio ciclo y su propio ritmo, sin coordinación 
+entre ellas. Un hilo de reloj (GameClock, ScheduledExecutorService de un hilo) dispara repaint() cada 60 ms 
+delegándolo al EDT.
+
 ### 2) Correcciones mínimas y regiones críticas
 
 - **Elimina** esperas activas reemplazándolas por **señales** / **estados** o mecanismos de la librería de concurrencia.
