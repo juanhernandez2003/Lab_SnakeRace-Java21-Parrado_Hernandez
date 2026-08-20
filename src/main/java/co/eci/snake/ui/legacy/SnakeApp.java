@@ -7,6 +7,7 @@ import co.eci.snake.core.GameState;
 import co.eci.snake.core.Position;
 import co.eci.snake.core.RaceStats;
 import co.eci.snake.core.Snake;
+import co.eci.snake.core.WorldSnapshot;
 import co.eci.snake.core.engine.GameClock;
 
 import javax.swing.*;
@@ -55,21 +56,28 @@ public final class SnakeApp extends JFrame {
 
   public SnakeApp() {
     super("The Snake Race");
-    this.board = new Board(35, 28);
 
-    int n = Integer.getInteger("snakes", 2);
+    int n = Math.max(1, Integer.getInteger("snakes", 2));
+    // El tablero crece con N: con muchas serpientes en 35x28 la densidad es tal que la mayoría choca
+    // en el primer segundo. Se reservan al menos ~45 casillas por serpiente.
+    int w = 35, h = 28;
+    while (w * h < n * 45) { w += 5; h += 4; }
+    this.board = new Board(w, h);
+
+    // Casillas iniciales distintas: el reparto original repetía posiciones con N alto y varias
+    // serpientes nacían una encima de otra, muriendo en el primer movimiento.
+    var spawns = board.spawnPositions(n);
     var built = new java.util.ArrayList<Snake>(n);
     for (int i = 0; i < n; i++) {
-      int x = 2 + (i * 3) % board.width();
-      int y = 2 + (i * 2) % board.height();
+      var p = spawns.get(i % spawns.size());
       var dir = Direction.values()[i % Direction.values().length];
-      built.add(Snake.of("Serpiente " + i, x, y, dir));
+      built.add(Snake.of("Serpiente " + i, p.x(), p.y(), dir));
     }
     // Publicación segura: la lista queda inmutable antes de compartirse con el EDT y con los runners.
     this.snakes = List.copyOf(built);
     board.register(this.snakes);
 
-    this.gamePanel = new GamePanel(board, () -> snakes);
+    this.gamePanel = new GamePanel(board);
     this.startButton = new JButton("Iniciar");
     this.pauseButton = new JButton("Pausar");
     this.pauseButton.setEnabled(false);
@@ -200,26 +208,28 @@ public final class SnakeApp extends JFrame {
 
   public static final class GamePanel extends JPanel {
     private final Board board;
-    private final Supplier snakesSupplier;
     private final int cell = 20;
 
-    @FunctionalInterface
-    public interface Supplier {
-      List<Snake> get();
-    }
-
-    public GamePanel(Board board, Supplier snakesSupplier) {
+    public GamePanel(Board board) {
       this.board = board;
-      this.snakesSupplier = snakesSupplier;
       setPreferredSize(new Dimension(board.width() * cell + 1, board.height() * cell + 40));
       setBackground(Color.WHITE);
     }
 
+    /**
+     * Dibuja un fotograma a partir de una <b>única</b> foto del mundo.
+     *
+     * <p>Antes se hacían cinco lecturas independientes (ratones, obstáculos, turbo, teleports y cada
+     * serpiente) tomadas en instantes distintos, de modo que un mismo fotograma podía mezclar varios
+     * estados del juego. Ahora {@code board.snapshot()} devuelve todo junto, capturado bajo el lock.</p>
+     */
     @Override
     protected void paintComponent(Graphics g) {
       super.paintComponent(g);
       var g2 = (Graphics2D) g.create();
       g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+      WorldSnapshot world = board.snapshot();
 
       g2.setColor(new Color(220, 220, 220));
       for (int x = 0; x <= board.width(); x++)
@@ -229,7 +239,7 @@ public final class SnakeApp extends JFrame {
 
       // Obstáculos
       g2.setColor(new Color(255, 102, 0));
-      for (var p : board.obstacles()) {
+      for (var p : world.obstacles()) {
         int x = p.x() * cell, y = p.y() * cell;
         g2.fillRect(x + 2, y + 2, cell - 4, cell - 4);
         g2.setColor(Color.RED);
@@ -241,7 +251,7 @@ public final class SnakeApp extends JFrame {
 
       // Ratones
       g2.setColor(Color.BLACK);
-      for (var p : board.mice()) {
+      for (var p : world.mice()) {
         int x = p.x() * cell, y = p.y() * cell;
         g2.fillOval(x + 4, y + 4, cell - 8, cell - 8);
         g2.setColor(Color.WHITE);
@@ -250,7 +260,7 @@ public final class SnakeApp extends JFrame {
       }
 
       // Teleports (flechas rojas)
-      Map<Position, Position> tp = board.teleports();
+      Map<Position, Position> tp = world.teleports();
       g2.setColor(Color.RED);
       for (var entry : tp.entrySet()) {
         Position from = entry.getKey();
@@ -262,22 +272,20 @@ public final class SnakeApp extends JFrame {
 
       // Turbo (rayos)
       g2.setColor(Color.BLACK);
-      for (var p : board.turbo()) {
+      for (var p : world.turbo()) {
         int x = p.x() * cell, y = p.y() * cell;
         int[] xs = { x + 8, x + 12, x + 10, x + 14, x + 6, x + 10 };
         int[] ys = { y + 2, y + 2, y + 8, y + 8, y + 16, y + 10 };
         g2.fillPolygon(xs, ys, xs.length);
       }
 
-      // Serpientes: se dibuja la copia inmutable devuelta por snapshot(), nunca la estructura viva.
-      var currentSnakes = snakesSupplier.get();
+      // Serpientes
       int idx = 0;
-      for (Snake s : currentSnakes) {
-        List<Position> body = s.snapshot();
-        boolean alive = s.isAlive();
+      for (WorldSnapshot.SnakeView s : world.snakes()) {
+        List<Position> body = s.body();
         for (int i = 0; i < body.size(); i++) {
           var p = body.get(i);
-          Color base = !alive ? new Color(140, 140, 140)
+          Color base = !s.alive() ? new Color(140, 140, 140)
               : (idx == 0) ? new Color(0, 170, 0) : new Color(0, 160, 180);
           int shade = Math.max(0, 40 - i * 4);
           g2.setColor(new Color(

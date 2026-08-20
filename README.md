@@ -229,6 +229,47 @@ recálculo hecho por fuera; al reanudar todas vuelven a moverse; y al detener, t
 - El juego **no debe romperse**: sin `ConcurrentModificationException`, sin lecturas inconsistentes, sin _deadlocks_.
 - Si habilitas **teleports** y **turbo**, verifica que las reglas no introduzcan carreras.
 
+Defectos encontrados al subir N. Ejecutando con 50 serpientes aparecieron tres problemas que no eran de
+sincronización sino de reglas, pero que igualmente rompían la partida. El primero es el reparto inicial: la
+fórmula original (2 + i*3 mod ancho, 2 + i*2 mod alto) repite posiciones en cuanto N supera unas pocas
+decenas, de modo que varias serpientes nacían una encima de otra y morían en su primer movimiento. Se
+sustituyó por Board.spawnPositions(n), que garantiza casillas distintas y libres. El segundo es el crecimiento
+sin tope de los obstáculos: cada ratón comido añadía uno nuevo que jamás se retiraba, así que en una partida
+larga el tablero terminaba saturado y las serpientes solo rebotaban; ahora hay un límite del 10% de las
+casillas. El tercero es que randomEmpty() solo evitaba otros ítems, por lo que un obstáculo nuevo podía
+aparecer justo encima de una serpiente; ahora también evita los cuerpos vivos. Además, el tablero se
+dimensiona en función de N (mínimo unas 45 casillas por serpiente), porque con 50 serpientes en 35x28 la
+densidad hace que la mayoría choque en el primer segundo: en 35x28 quedaban 4 vivas a los 6 segundos, y con el
+tablero escalado a 60x48 quedan 11.
+
+Eliminación del tearing en el render. El análisis del punto 1 señalaba que paintComponent hacía cinco lecturas
+independientes del mundo tomadas en instantes distintos. Se añadió Board.snapshot(), que devuelve un record
+inmutable WorldSnapshot con ratones, obstáculos, turbo, teleports y el cuerpo de cada serpiente capturados de
+una sola vez bajo el lock. La UI dibuja a partir de esa única foto, de modo que un fotograma corresponde
+siempre a un instante real de la partida y no a una mezcla de varios.
+
+Teleports y turbo. Ambas reglas quedan dentro de la región crítica de step(), así que no introducen carreras:
+la resolución del teleport, el consumo del ratón o del turbo y el avance de la serpiente ocurren sin soltar el
+lock. El consumo es un check-and-act atómico (mice.remove y turbo.remove devuelven si el ítem estaba), por lo
+que un mismo ratón o un mismo turbo no pueden ser consumidos por dos serpientes. El estado de turbo
+(turboTicks) es una variable local de cada SnakeRunner, no compartida, así que no necesita sincronización.
+
+Pruebas automáticas. Se añadieron siete pruebas JUnit 5 en src/test/java que se ejecutan con mvn clean verify:
+
+- Las casillas iniciales nunca se repiten, ni siquiera con N alto.
+- Con 40 hilos moviéndose y un hilo leyendo el mundo sin descanso durante tres segundos no se produce ninguna
+  excepción de concurrencia.
+- Dos serpientes vivas nunca comparten casilla en una foto coherente, verificado de forma continua durante
+  tres segundos con 30 serpientes.
+- El número de obstáculos se mantiene acotado en una partida larga.
+- En pausa el reloj no ejecuta ni un solo tick, lo que demuestra que la espera es por señal y no por sondeo.
+- Al pausar, las estadísticas y las posiciones de las 25 serpientes son idénticas al releerlas 600 ms después,
+  y al reanudar vuelven a moverse.
+- Al detener, todas las serpientes bloqueadas despiertan y sus hilos terminan.
+
+Las tres pruebas del reloj llevan @Timeout, de modo que un deadlock o un despertar perdido harían fallar la
+prueba por tiempo en lugar de colgar la construcción. Las siete pasan.
+
 > Entregables detallados más abajo.
 
 ---

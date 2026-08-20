@@ -1,6 +1,7 @@
 package co.eci.snake.core;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -25,6 +26,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class Board {
   private final int width;
   private final int height;
+  private final int maxObstacles;
 
   private final Set<Position> mice = ConcurrentHashMap.newKeySet();
   private final Set<Position> obstacles = ConcurrentHashMap.newKeySet();
@@ -44,6 +46,7 @@ public final class Board {
     if (width <= 0 || height <= 0) throw new IllegalArgumentException("Board dimensions must be positive");
     this.width = width;
     this.height = height;
+    this.maxObstacles = Math.max(8, (width * height) / 10);   // hasta el 10% del tablero
     for (int i = 0; i < 6; i++) mice.add(randomEmpty());
     for (int i = 0; i < 4; i++) obstacles.add(randomEmpty());
     for (int i = 0; i < 3; i++) turbo.add(randomEmpty());
@@ -69,6 +72,9 @@ public final class Board {
     Objects.requireNonNull(snake, "snake");
     lock.lock();
     try {
+      // Una serpiente muerta no vuelve a moverse aunque alguien insista en llamar a step().
+      if (!snake.isAlive()) return MoveResult.DIED;
+
       var view = snake.peek();
       var dir = view.direction();
       Position next = new Position(view.position().x() + dir.dx, view.position().y() + dir.dy)
@@ -99,7 +105,9 @@ public final class Board {
 
       if (ateMouse) {
         mice.add(randomEmpty());
-        obstacles.add(randomEmpty());
+        // Tope de obstáculos: en la versión original crecían sin límite (uno por ratón comido) y en
+        // una partida larga el tablero terminaba saturado y las serpientes solo rebotaban.
+        if (obstacles.size() < maxObstacles) obstacles.add(randomEmpty());
         if (ThreadLocalRandom.current().nextDouble() < 0.2) turbo.add(randomEmpty());
       }
 
@@ -155,13 +163,77 @@ public final class Board {
     }
   }
 
+  /**
+   * Foto completa del mundo para el render, tomada de una sola vez bajo el lock.
+   *
+   * <p>Un único fotograma no puede mezclar estados de instantes distintos, que era el origen del
+   * tearing: antes la UI leía ratones, obstáculos, turbo, teleports y cada serpiente por separado.</p>
+   */
+  public WorldSnapshot snapshot() {
+    lock.lock();
+    try {
+      var views = new ArrayList<WorldSnapshot.SnakeView>(snakes.size());
+      for (Snake s : snakes) {
+        views.add(new WorldSnapshot.SnakeView(s.name(), s.isAlive(), s.snapshot()));
+      }
+      return new WorldSnapshot(Set.copyOf(mice), Set.copyOf(obstacles), Set.copyOf(turbo),
+          Map.copyOf(teleports), List.copyOf(views));
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * Devuelve {@code n} casillas libres y <b>distintas</b> para colocar las serpientes al inicio.
+   *
+   * <p>El reparto original ({@code 2 + (i*3) % width}, {@code 2 + (i*2) % height}) repite posiciones
+   * en cuanto N crece, así que con {@code -Dsnakes=50} varias serpientes nacían una encima de otra y
+   * morían en el primer movimiento. Aquí se garantiza que no haya duplicados ni solapamiento con
+   * obstáculos, ratones, turbo o teleports.</p>
+   */
+  public List<Position> spawnPositions(int n) {
+    if (n < 0) throw new IllegalArgumentException("n must be >= 0");
+    lock.lock();
+    try {
+      var chosen = new LinkedHashSet<Position>(Math.max(16, n * 2));
+      int stride = Math.max(2, (width * height) / Math.max(1, n));
+      int cell = 0;
+      int cells = width * height;
+      // Barrido determinista y espaciado; si el paso cae en una casilla ocupada, se avanza.
+      for (int i = 0; i < n; i++) {
+        int guard = 0;
+        Position p;
+        do {
+          p = new Position(cell % width, (cell / width) % height);
+          cell = (cell + ((guard == 0) ? stride : 1)) % cells;
+          guard++;
+        } while (guard <= cells && (chosen.contains(p) || isItem(p)));
+        chosen.add(p);
+      }
+      return List.copyOf(chosen);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  private boolean isItem(Position p) {
+    return mice.contains(p) || obstacles.contains(p) || turbo.contains(p) || teleports.containsKey(p);
+  }
+
   /** Solo se invoca con el lock tomado. Los cadáveres no bloquean: solo cuentan los cuerpos vivos. */
   private boolean collides(Snake mover, Position next) {
+    boolean moverSeen = false;
     for (Snake other : snakes) {
-      if (!other.isAlive()) continue;
+      if (other == mover) {
+        moverSeen = true;
+        // Contra el propio cuerpo se ignora la cola: va a liberarse en este mismo movimiento.
+        if (mover.occupiesExceptTail(next)) return true;
+        continue;
+      }
+      if (!other.isAlive()) continue;   // los cadáveres no bloquean
       if (other.occupies(next)) return true;
     }
-    return mover.occupies(next);
+    return !moverSeen && mover.occupiesExceptTail(next);
   }
 
   private void createTeleportPairs(int pairs) {
@@ -173,7 +245,12 @@ public final class Board {
     }
   }
 
-  /** Solo se invoca desde el constructor o con el lock ya tomado. */
+  /**
+   * Casilla libre al azar. Solo se invoca desde el constructor o con el lock ya tomado.
+   *
+   * <p>Además de evitar otros ítems, ahora evita los cuerpos vivos: antes un obstáculo nuevo podía
+   * aparecer justo encima de una serpiente y dejarla rebotando contra sí misma.</p>
+   */
   private Position randomEmpty() {
     var rnd = ThreadLocalRandom.current();
     Position p;
@@ -182,7 +259,14 @@ public final class Board {
       p = new Position(rnd.nextInt(width), rnd.nextInt(height));
       guard++;
       if (guard > width * height * 2) break;
-    } while (mice.contains(p) || obstacles.contains(p) || turbo.contains(p) || teleports.containsKey(p));
+    } while (isItem(p) || occupiedByLiveSnake(p));
     return p;
+  }
+
+  private boolean occupiedByLiveSnake(Position p) {
+    for (Snake s : snakes) {
+      if (s.isAlive() && s.occupies(p)) return true;
+    }
+    return false;
   }
 }

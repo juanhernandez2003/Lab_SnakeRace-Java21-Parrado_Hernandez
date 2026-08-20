@@ -65,6 +65,18 @@ public final class Snake {
     return body.contains(p);
   }
 
+  /**
+   * Como {@link #occupies(Position)} pero ignorando la cola, que va a liberarse en este mismo
+   * movimiento. Es la regla clásica del snake: seguir la propia cola es legal.
+   */
+  public synchronized boolean occupiesExceptTail(Position p) {
+    if (body.size() <= 1) return false;
+    Position tail = body.peekLast();
+    if (!body.contains(p)) return false;
+    // Solo es segura si la cola no está repetida en otra parte del cuerpo.
+    return !p.equals(tail);
+  }
+
   public synchronized Direction direction() {
     return direction;
   }
