@@ -284,6 +284,49 @@ prueba por tiempo en lugar de colgar la construcción. Las siete pasan.
    - Regiones críticas definidas y justificación de su **alcance mínimo**.
 3. UI con **Iniciar / Pausar / Reanudar** y estadísticas solicitadas al pausar.
 
+### Resumen de entregables
+
+#### a) Data races encontradas y su solución
+
+| # | Riesgo | Dónde estaba | Solución aplicada |
+|---|--------|--------------|-------------------|
+| 1 | El hilo de la serpiente escribía el cuerpo con `advance()` mientras el EDT lo copiaba con `snapshot()`. Falla observada: `NullPointerException` en el render a los pocos segundos con 40 serpientes | `Snake.body` (`ArrayDeque`, sin protección) | Todo el estado de la serpiente pasa a estar bajo su propio monitor; `snapshot()` devuelve una copia inmutable tomada bajo ese lock |
+| 2 | *Check-then-act* sobre la dirección, escrito a la vez por el EDT (teclado) y por el runner (giro aleatorio): podía romperse la invariante de no ir en reversa | `Snake.turn()` | Método `synchronized`: comprobar y escribir es una sola operación atómica |
+| 3 | `int` sin `volatile` ni lock: sin garantía de visibilidad entre hilos | `Snake.maxLength` | Queda bajo el mismo monitor de la serpiente |
+| 4 | La dirección podía cambiar entre la lectura de la cabeza y la de la dirección, calculando la casilla destino con un estado mezclado | `Board.step()` | Nuevo `Snake.peek()`, que devuelve cabeza y dirección leídas bajo el mismo lock |
+| 5 | *Tearing*: el fotograma mezclaba cinco lecturas del mundo tomadas en instantes distintos | `GamePanel.paintComponent()` | Nuevo `Board.snapshot()` → record inmutable `WorldSnapshot` capturado de una sola vez bajo el lock |
+| 6 | `stop()` no cancelaba la tarea periódica, así que un `start()` posterior dejaba **dos** relojes vivos | `GameClock` | `pause()`/`stop()` cancelan el `ScheduledFuture`; las transiciones de estado ocurren bajo el monitor |
+| 7 | El estado de pausa se deducía del **texto del botón**: la vista era la fuente de verdad y podía desincronizarse del reloj | `SnakeApp.togglePause()` | Se consulta `clock.state()`, única fuente de verdad |
+| 8 | Publicación insegura: el constructor lanzaba los hilos y hacía `setVisible(true)`, exponiendo `this` antes de terminar de construirse | `SnakeApp` | El constructor solo arma la ventana; los hilos arrancan desde el botón *Iniciar* |
+
+#### b) Colecciones mal usadas y cómo se protegieron o sustituyeron
+
+| Estructura | Problema | Solución |
+|------------|----------|----------|
+| `Snake.body` (`ArrayDeque`) | Compartida entre el hilo de la serpiente y el EDT **sin protección alguna**. El caso crítico | Protegida por el monitor de la serpiente; hacia afuera solo se expone `List.copyOf(...)`, nunca la estructura viva |
+| `Board.mice`, `obstacles`, `turbo` (`HashSet`) y `teleports` (`HashMap`) | Estaban cubiertos, pero al precio de un `synchronized` global que también bloqueaba cada lectura del render | Sustituidos por `ConcurrentHashMap.newKeySet()` y `ConcurrentHashMap`. Las lecturas ya no toman lock y devuelven vistas inmutables (`Set.copyOf` / `Map.copyOf`) |
+| `SnakeApp.snakes` (`ArrayList`) | Compartida con el EDT sin barrera de memoria explícita; cualquier alta o baja en ejecución habría dado `ConcurrentModificationException` | Se construye y luego se publica como `List.copyOf(...)`: inmutable y de publicación segura |
+| Reparto inicial de posiciones | No es una colección, pero repetía casillas con N alto y varias serpientes nacían superpuestas | `Board.spawnPositions(n)` garantiza casillas distintas y libres |
+
+#### c) Esperas activas eliminadas y mecanismo utilizado
+
+| Dónde | Qué hacía antes | Mecanismo que la sustituye |
+|-------|-----------------|----------------------------|
+| `GameClock` | Durante la pausa la tarea periódica seguía disparándose cada 60 ms y en cada disparo consultaba el estado para no hacer nada: *polling* | `pause()` cancela el `ScheduledFuture` y `resume()` lo reprograma. **Cero ticks durante la pausa** (verificado por prueba) |
+| `SnakeRunner` | No existía forma de pausar: al pausar solo se congelaba el repintado y las serpientes seguían moviéndose. Resolverlo con `while (paused) {}` habría introducido *busy-wait* | `clock.awaitIfPaused()` bloquea el hilo con `wait()` sobre el monitor del reloj; `resume()` lo libera con `notifyAll()`. La espera está dentro de un `while` sobre la condición, no de un `if`, para no perder despertares |
+| Lectura de estadísticas al pausar | Habría requerido sondear hasta que las serpientes se detuvieran, porque la suspensión no es instantánea | `clock.awaitAllPaused(timeout)`: barrera de quiescencia que espera, también con `wait()`, a que todos los trabajadores estén bloqueados o terminados |
+| Parada de los hilos | El executor era una variable local: nadie podía detener las serpientes y el `catch (InterruptedException)` era código muerto | `stop()` hace `notifyAll()` y `awaitIfPaused()` devuelve `false`, de modo que cada hilo sale de su bucle por sí solo |
+
+#### d) Regiones críticas definidas y justificación de su alcance mínimo
+
+| Lock | Qué protege | Por qué es el alcance mínimo |
+|------|-------------|------------------------------|
+| `ReentrantLock` de `Board` | Solo la secuencia compuesta de `step()` (consultar obstáculo, resolver teleport, detectar choque, consumir ratón o turbo, avanzar y reponer ítems) y las fotos coherentes `stats()` / `snapshot()` | Esa secuencia **debe** ser atómica frente a las demás serpientes: si se soltara el lock a mitad, dos podrían comer el mismo ratón, cruzarse sin chocar o avanzar sobre un mundo obsoleto. Fuera de ella el lock no se toma: los cuatro getters de lectura son ahora libres de lock, así que el render ya no compite con la simulación |
+| Monitor intrínseco de cada `Snake` | El cuerpo, la dirección y `maxLength` de **esa** serpiente | Es el grano más fino posible: dos serpientes distintas nunca se bloquean entre sí. La alternativa (un lock global de serpientes) serializaría movimientos independientes sin ninguna necesidad |
+| Monitor de `GameClock` | El estado de la partida, la tarea programada y el conteo de trabajadores registrados, bloqueados y terminados | Son datos que solo tienen sentido leídos juntos: el estado decide si un hilo se bloquea y el conteo decide si la pausa ya es efectiva. Las esperas se hacen con `wait()`, que libera el monitor mientras tanto |
+
+**Ausencia de deadlock.** El orden de adquisición es siempre `Board → Snake`, y ningún método de `Snake` invoca al `Board`, por lo que no puede formarse un ciclo. El monitor del `GameClock` nunca se mantiene tomado mientras se pide el lock del tablero: la barrera de quiescencia termina antes de leer las estadísticas. Las pruebas del reloj llevan `@Timeout`, de modo que un deadlock o un despertar perdido harían fallar la prueba por tiempo en lugar de colgar la construcción.
+
 ---
 
 ## Criterios de evaluación (10)
