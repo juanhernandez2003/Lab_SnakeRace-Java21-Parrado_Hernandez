@@ -3,6 +3,7 @@ package co.eci.snake.ui.legacy;
 import co.eci.snake.concurrency.SnakeRunner;
 import co.eci.snake.core.Board;
 import co.eci.snake.core.Direction;
+import co.eci.snake.core.GameState;
 import co.eci.snake.core.Position;
 import co.eci.snake.core.Snake;
 import co.eci.snake.core.engine.GameClock;
@@ -10,32 +11,55 @@ import co.eci.snake.core.engine.GameClock;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.ActionEvent;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * UI legado (Swing).
+ *
+ * <p>Correcciones de concurrencia introducidas en este punto:</p>
+ * <ul>
+ *   <li><b>Sin fuga de {@code this}.</b> El constructor solo arma la ventana; los hilos y el reloj
+ *       arrancan en {@link #start()}, cuando el objeto ya está completamente construido.</li>
+ *   <li><b>Estado en un solo lugar.</b> {@code togglePause()} consulta el estado real del
+ *       {@link GameClock} en vez de deducirlo del texto del botón, que era una fuente de verdad
+ *       ubicada en la vista y podía desincronizarse (botón vs. barra espaciadora).</li>
+ *   <li><b>Apagado ordenado.</b> El executor de las serpientes ahora es un campo, se interrumpe al
+ *       cerrar la ventana y el reloj se cierra con él; antes era una variable local y los hilos no
+ *       se podían detener.</li>
+ * </ul>
+ */
 public final class SnakeApp extends JFrame {
 
   private final Board board;
   private final GamePanel gamePanel;
   private final JButton actionButton;
   private final GameClock clock;
-  private final java.util.List<Snake> snakes = new java.util.ArrayList<>();
+  private final List<Snake> snakes;
+  private final ExecutorService snakeExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
   public SnakeApp() {
     super("The Snake Race");
     this.board = new Board(35, 28);
 
-    int N = Integer.getInteger("snakes", 2);
-    for (int i = 0; i < N; i++) {
+    int n = Integer.getInteger("snakes", 2);
+    var built = new java.util.ArrayList<Snake>(n);
+    for (int i = 0; i < n; i++) {
       int x = 2 + (i * 3) % board.width();
       int y = 2 + (i * 2) % board.height();
       var dir = Direction.values()[i % Direction.values().length];
-      snakes.add(Snake.of(x, y, dir));
+      built.add(Snake.of(x, y, dir));
     }
+    // Publicación segura: la lista queda inmutable antes de compartirse con el EDT y con los runners.
+    this.snakes = List.copyOf(built);
 
     this.gamePanel = new GamePanel(board, () -> snakes);
-    this.actionButton = new JButton("Action");
+    this.actionButton = new JButton("Pausar");
+    this.clock = new GameClock(60, () -> SwingUtilities.invokeLater(gamePanel::repaint));
 
     setLayout(new BorderLayout());
     add(gamePanel, BorderLayout.CENTER);
@@ -45,52 +69,52 @@ public final class SnakeApp extends JFrame {
     pack();
     setLocationRelativeTo(null);
 
-    this.clock = new GameClock(60, () -> SwingUtilities.invokeLater(gamePanel::repaint));
-
-    var exec = Executors.newVirtualThreadPerTaskExecutor();
-    snakes.forEach(s -> exec.submit(new SnakeRunner(s, board)));
-
     actionButton.addActionListener((ActionEvent e) -> togglePause());
+    bindKeys();
 
-    gamePanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("SPACE"), "pause");
-    gamePanel.getActionMap().put("pause", new AbstractAction() {
-      @Override
-      public void actionPerformed(ActionEvent e) {
-        togglePause();
-      }
+    addWindowListener(new WindowAdapter() {
+      @Override public void windowClosing(WindowEvent e) { shutdown(); }
     });
+  }
 
-    var player = snakes.get(0);
+  /** Arranca la simulación. Se invoca cuando el objeto ya está construido, para no publicar {@code this} a medias. */
+  public void start() {
+    setVisible(true);
+    clock.start();
+    snakes.forEach(s -> snakeExecutor.submit(new SnakeRunner(s, board, clock)));
+  }
+
+  private void shutdown() {
+    clock.close();              // detiene el reloj y despierta a las serpientes bloqueadas
+    snakeExecutor.shutdownNow();
+  }
+
+  private void togglePause() {
+    if (clock.state() == GameState.RUNNING) {
+      clock.pause();
+      actionButton.setText("Reanudar");
+    } else {
+      clock.resume();
+      actionButton.setText("Pausar");
+    }
+  }
+
+  private void bindKeys() {
     InputMap im = gamePanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW);
     ActionMap am = gamePanel.getActionMap();
+
+    im.put(KeyStroke.getKeyStroke("SPACE"), "pause");
+    am.put("pause", action(this::togglePause));
+
+    var player = snakes.get(0);
     im.put(KeyStroke.getKeyStroke("LEFT"), "left");
     im.put(KeyStroke.getKeyStroke("RIGHT"), "right");
     im.put(KeyStroke.getKeyStroke("UP"), "up");
     im.put(KeyStroke.getKeyStroke("DOWN"), "down");
-    am.put("left", new AbstractAction() {
-      @Override
-      public void actionPerformed(ActionEvent e) {
-        player.turn(Direction.LEFT);
-      }
-    });
-    am.put("right", new AbstractAction() {
-      @Override
-      public void actionPerformed(ActionEvent e) {
-        player.turn(Direction.RIGHT);
-      }
-    });
-    am.put("up", new AbstractAction() {
-      @Override
-      public void actionPerformed(ActionEvent e) {
-        player.turn(Direction.UP);
-      }
-    });
-    am.put("down", new AbstractAction() {
-      @Override
-      public void actionPerformed(ActionEvent e) {
-        player.turn(Direction.DOWN);
-      }
-    });
+    am.put("left", action(() -> player.turn(Direction.LEFT)));
+    am.put("right", action(() -> player.turn(Direction.RIGHT)));
+    am.put("up", action(() -> player.turn(Direction.UP)));
+    am.put("down", action(() -> player.turn(Direction.DOWN)));
 
     if (snakes.size() > 1) {
       var p2 = snakes.get(1);
@@ -98,44 +122,17 @@ public final class SnakeApp extends JFrame {
       im.put(KeyStroke.getKeyStroke('D'), "p2-right");
       im.put(KeyStroke.getKeyStroke('W'), "p2-up");
       im.put(KeyStroke.getKeyStroke('S'), "p2-down");
-      am.put("p2-left", new AbstractAction() {
-        @Override
-        public void actionPerformed(ActionEvent e) {
-          p2.turn(Direction.LEFT);
-        }
-      });
-      am.put("p2-right", new AbstractAction() {
-        @Override
-        public void actionPerformed(ActionEvent e) {
-          p2.turn(Direction.RIGHT);
-        }
-      });
-      am.put("p2-up", new AbstractAction() {
-        @Override
-        public void actionPerformed(ActionEvent e) {
-          p2.turn(Direction.UP);
-        }
-      });
-      am.put("p2-down", new AbstractAction() {
-        @Override
-        public void actionPerformed(ActionEvent e) {
-          p2.turn(Direction.DOWN);
-        }
-      });
+      am.put("p2-left", action(() -> p2.turn(Direction.LEFT)));
+      am.put("p2-right", action(() -> p2.turn(Direction.RIGHT)));
+      am.put("p2-up", action(() -> p2.turn(Direction.UP)));
+      am.put("p2-down", action(() -> p2.turn(Direction.DOWN)));
     }
-
-    setVisible(true);
-    clock.start();
   }
 
-  private void togglePause() {
-    if ("Action".equals(actionButton.getText())) {
-      actionButton.setText("Resume");
-      clock.pause();
-    } else {
-      actionButton.setText("Action");
-      clock.resume();
-    }
+  private static AbstractAction action(Runnable r) {
+    return new AbstractAction() {
+      @Override public void actionPerformed(ActionEvent e) { r.run(); }
+    };
   }
 
   public static final class GamePanel extends JPanel {
@@ -209,13 +206,13 @@ public final class SnakeApp extends JFrame {
         g2.fillPolygon(xs, ys, xs.length);
       }
 
-      // Serpientes
-      var snakes = snakesSupplier.get();
+      // Serpientes: se dibuja la copia inmutable devuelta por snapshot(), nunca la estructura viva.
+      var currentSnakes = snakesSupplier.get();
       int idx = 0;
-      for (Snake s : snakes) {
-        var body = s.snapshot().toArray(new Position[0]);
-        for (int i = 0; i < body.length; i++) {
-          var p = body[i];
+      for (Snake s : currentSnakes) {
+        List<Position> body = s.snapshot();
+        for (int i = 0; i < body.size(); i++) {
+          var p = body.get(i);
           Color base = (idx == 0) ? new Color(0, 170, 0) : new Color(0, 160, 180);
           int shade = Math.max(0, 40 - i * 4);
           g2.setColor(new Color(
@@ -231,6 +228,6 @@ public final class SnakeApp extends JFrame {
   }
 
   public static void launch() {
-    SwingUtilities.invokeLater(SnakeApp::new);
+    SwingUtilities.invokeLater(() -> new SnakeApp().start());
   }
 }

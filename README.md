@@ -136,6 +136,52 @@ grave y el que revienta con -Dsnakes=20.
 - Protege **solo** las **regiones críticas estrictamente necesarias** (evita bloqueos amplios).
 - Justifica en **`el reporte de laboratorio`** cada cambio: cuál era el riesgo y cómo lo resuelves.
 
+Eliminación de la espera activa. El GameClock era la única fuente de polling: durante la pausa la tarea
+periódica seguía disparándose cada 60 ms y en cada disparo comprobaba el estado para no hacer nada. Ahora
+pause() cancela el ScheduledFuture y resume() lo reprograma, de modo que en pausa no se ejecuta ningún tick.
+Además la pausa antes no detenía la simulación: solo congelaba el repintado mientras las serpientes seguían
+moviéndose. Se resolvió convirtiendo al GameClock en la única fuente de verdad del estado de la partida y
+dándole un punto de suspensión, awaitIfPaused(), que los SnakeRunner invocan al inicio de cada iteración. Los
+hilos quedan bloqueados en wait() sobre el monitor del reloj, sin consumir CPU, y se reanudan por señal con
+notifyAll() desde resume(); la espera está dentro de un while sobre la condición, no de un if, para no perder
+despertares ni caer en despertares espurios. stop() también hace notifyAll() y awaitIfPaused() devuelve false,
+así que los hilos salen limpiamente de su bucle en vez de quedar bloqueados para siempre.
+
+Regiones críticas de alcance mínimo. Board era synchronized en su totalidad: el mismo lock cubría step() y los
+cuatro getters, así que el EDT competía con las N serpientes en cada frame y la simulación quedaba
+completamente serializada. El estado del tablero pasó a colecciones concurrentes
+(ConcurrentHashMap.newKeySet() y ConcurrentHashMap), con lo cual las lecturas ya no toman ningún lock y
+devuelven una vista inmutable, y el lock explícito (un ReentrantLock) quedó reducido a lo estrictamente
+necesario: la secuencia compuesta de step(), que consulta obstáculos, resuelve el teleport, consume ratón o
+turbo, avanza la serpiente y repone ítems. Esa secuencia sí debe ser atómica frente a las demás serpientes,
+porque si se liberara el lock a mitad dos de ellas podrían consumir el mismo ratón o avanzar sobre un mundo ya
+obsoleto.
+
+Protección del estado de la serpiente. El riesgo más grave estaba en Snake, que no tenía ninguna protección:
+el hilo de la serpiente escribía el ArrayDeque con advance() mientras el EDT lo copiaba con snapshot(). Se
+comprobó ejecutando el código original con 40 serpientes y un hilo que solo repinta: el render falla con
+NullPointerException en pocos segundos. Ahora todo el estado de la serpiente (cuerpo, dirección y maxLength)
+queda bajo su propio monitor intrínseco, que es el lock de grano más fino posible porque dos serpientes
+distintas nunca se bloquean entre sí; snapshot() devuelve una copia inmutable tomada bajo ese lock, de modo que
+el EDT jamás toca la estructura viva. turn() pasó a ser synchronized para que la comprobación de no ir en
+reversa y la escritura de la dirección sean una sola operación atómica, ya que la invocan a la vez el EDT
+(teclado) y el propio runner (giro aleatorio). Se añadió peek(), que devuelve cabeza y dirección leídas bajo el
+mismo lock, para que el tablero no calcule la casilla destino con un estado mezclado. El orden de adquisición
+es siempre Board y luego Snake, y ningún método de Snake llama al Board, por lo que no puede formarse un ciclo
+ni un deadlock.
+
+Correcciones en la UI. togglePause() deducía el estado del texto del botón; ahora consulta el estado real del
+GameClock, con lo que el botón y la barra espaciadora no pueden desincronizarse. El executor de las serpientes
+dejó de ser una variable local y es un campo que se interrumpe al cerrar la ventana, junto con el cierre del
+reloj: antes nadie podía detener los hilos y el manejo de InterruptedException era código muerto. Por último,
+el constructor ya no lanza hilos ni hace setVisible(true); eso se movió a start(), que se invoca cuando el
+objeto ya está completamente construido, evitando la publicación insegura de this.
+
+Verificación. Con 40 serpientes y un hilo que simula al EDT leyendo el tablero y las serpientes sin pausa
+durante varios segundos no se produce ninguna excepción; al pausar, las cabezas de las 40 serpientes quedan
+idénticas durante 800 ms y el reloj no ejecuta ni un solo tick; al reanudar, ambas cosas se restablecen; y tras
+stop() todos los hilos terminan por sí solos dentro del timeout.
+
 ### 3) Control de ejecución seguro (UI)
 
 - Implementa la **UI** con **Iniciar / Pausar / Reanudar** (ya existe el botón _Action_ y el reloj `GameClock`).
