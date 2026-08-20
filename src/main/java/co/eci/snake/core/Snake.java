@@ -22,17 +22,47 @@ public final class Snake {
   /** Lectura atómica de cabeza + dirección, para que quien decide el movimiento vea un par coherente. */
   public record Head(Position position, Direction direction) {}
 
+  private static final java.util.concurrent.atomic.AtomicInteger SEQ =
+      new java.util.concurrent.atomic.AtomicInteger();
+
+  private final String name;
   private final Deque<Position> body = new ArrayDeque<>();
   private Direction direction;
   private int maxLength = 5;
+  private boolean alive = true;
 
-  private Snake(Position start, Direction dir) {
+  private Snake(String name, Position start, Direction dir) {
+    this.name = name;
     body.addFirst(start);
     this.direction = dir;
   }
 
   public static Snake of(int x, int y, Direction dir) {
-    return new Snake(new Position(x, y), Objects.requireNonNull(dir, "dir"));
+    return of("Serpiente " + SEQ.getAndIncrement(), x, y, dir);
+  }
+
+  public static Snake of(String name, int x, int y, Direction dir) {
+    return new Snake(Objects.requireNonNull(name, "name"), new Position(x, y),
+        Objects.requireNonNull(dir, "dir"));
+  }
+
+  /** Inmutable, por lo que puede leerse desde cualquier hilo sin sincronización. */
+  public String name() {
+    return name;
+  }
+
+  public synchronized boolean isAlive() {
+    return alive;
+  }
+
+  /** Marca la serpiente como muerta. Solo lo invoca el Board, con su lock tomado. */
+  public synchronized void kill() {
+    alive = false;
+  }
+
+  /** ¿Esta serpiente ocupa la casilla dada? Se consulta bajo el lock del tablero para detectar choques. */
+  public synchronized boolean occupies(Position p) {
+    return body.contains(p);
   }
 
   public synchronized Direction direction() {

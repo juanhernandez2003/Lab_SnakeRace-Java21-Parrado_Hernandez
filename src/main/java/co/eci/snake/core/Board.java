@@ -1,5 +1,7 @@
 package co.eci.snake.core;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -32,7 +34,11 @@ public final class Board {
   /** Región crítica del mundo: solo protege la transición de un movimiento completo. */
   private final ReentrantLock lock = new ReentrantLock();
 
-  public enum MoveResult { MOVED, ATE_MOUSE, HIT_OBSTACLE, ATE_TURBO, TELEPORTED }
+  /** Serpientes de la partida y orden en que fueron muriendo. Ambas listas se tocan solo bajo el lock. */
+  private final List<Snake> snakes = new ArrayList<>();
+  private final List<Snake> deathOrder = new ArrayList<>();
+
+  public enum MoveResult { MOVED, ATE_MOUSE, HIT_OBSTACLE, ATE_TURBO, TELEPORTED, DIED }
 
   public Board(int width, int height) {
     if (width <= 0 || height <= 0) throw new IllegalArgumentException("Board dimensions must be positive");
@@ -77,6 +83,15 @@ public final class Board {
         teleported = true;
       }
 
+      // Choque: la cabeza entra en una casilla ocupada por un cuerpo vivo (propio o ajeno).
+      // La comprobación y el avance ocurren bajo el mismo lock, de modo que dos serpientes no
+      // pueden "cruzarse" leyendo ambas un estado anterior al movimiento de la otra.
+      if (collides(snake, next)) {
+        snake.kill();
+        deathOrder.add(snake);
+        return MoveResult.DIED;
+      }
+
       boolean ateMouse = mice.remove(next);
       boolean ateTurbo = turbo.remove(next);
 
@@ -95,6 +110,58 @@ public final class Board {
     } finally {
       lock.unlock();
     }
+  }
+
+  /** Registra las serpientes de la partida. Se invoca una sola vez, antes de arrancar los hilos. */
+  public void register(List<Snake> participants) {
+    Objects.requireNonNull(participants, "participants");
+    lock.lock();
+    try {
+      snakes.clear();
+      snakes.addAll(participants);
+      deathOrder.clear();
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * Estadísticas coherentes de la carrera.
+   *
+   * <p>Se calculan con el lock del tablero tomado, de modo que ninguna serpiente puede estar a mitad
+   * de un {@code step()} mientras se leen: o el movimiento ya terminó, o todavía no ha empezado.
+   * Todas las longitudes corresponden por tanto al mismo instante lógico y el record resultante,
+   * al ser inmutable, viaja al EDT sin posibilidad de cambiar mientras se dibuja.</p>
+   */
+  public RaceStats stats() {
+    lock.lock();
+    try {
+      RaceStats.SnakeStat longest = null;
+      int alive = 0;
+      for (Snake s : snakes) {
+        if (!s.isAlive()) continue;
+        alive++;
+        int len = s.length();
+        if (longest == null || len > longest.length()) {
+          longest = new RaceStats.SnakeStat(s.name(), len);
+        }
+      }
+      RaceStats.SnakeStat worst = deathOrder.isEmpty()
+          ? null
+          : new RaceStats.SnakeStat(deathOrder.get(0).name(), deathOrder.get(0).length());
+      return new RaceStats(longest, worst, alive, snakes.size());
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /** Solo se invoca con el lock tomado. Los cadáveres no bloquean: solo cuentan los cuerpos vivos. */
+  private boolean collides(Snake mover, Position next) {
+    for (Snake other : snakes) {
+      if (!other.isAlive()) continue;
+      if (other.occupies(next)) return true;
+    }
+    return mover.occupies(next);
   }
 
   private void createTeleportPairs(int pairs) {

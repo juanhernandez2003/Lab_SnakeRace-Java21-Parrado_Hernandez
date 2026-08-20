@@ -41,7 +41,9 @@ public final class SnakeRunner implements Runnable {
 
         maybeTurn();
         var res = board.step(snake);
-        if (res == Board.MoveResult.HIT_OBSTACLE) {
+        if (res == Board.MoveResult.DIED) {
+          return;                       // la serpiente murió: el hilo termina, no queda colgado
+        } else if (res == Board.MoveResult.HIT_OBSTACLE) {
           randomTurn();
         } else if (res == Board.MoveResult.ATE_TURBO) {
           turboTicks = 100;
@@ -52,6 +54,9 @@ public final class SnakeRunner implements Runnable {
       }
     } catch (InterruptedException ie) {
       Thread.currentThread().interrupt();
+    } finally {
+      // Deja de contar como trabajador pendiente para la barrera de quiescencia de la pausa.
+      clock.workerFinished();
     }
   }
 

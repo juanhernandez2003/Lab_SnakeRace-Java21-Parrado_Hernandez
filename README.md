@@ -190,6 +190,39 @@ stop() todos los hilos terminan por sí solos dentro del timeout.
   - La **peor serpiente** (la que **primero murió**).
 - Considera que la suspensión **no es instantánea**; coordina para que el estado mostrado no quede “a medias”.
 
+Reglas de muerte. El enunciado pide mostrar la peor serpiente, entendida como la primera que murió, pero el
+juego original no tenía ninguna noción de muerte: dos serpientes podían ocupar la misma casilla sin
+consecuencia. Se añadió la regla mínima que hace significativa esa estadística: si la cabeza entra en una
+casilla ocupada por un cuerpo vivo, propio o ajeno, la serpiente muere. La comprobación de ocupación y el
+avance ocurren dentro del mismo lock del tablero, de modo que dos serpientes no pueden cruzarse leyendo cada
+una un estado anterior al movimiento de la otra. Al morir, la serpiente se marca como no viva, se registra en
+la lista de orden de muertes y su hilo termina, en lugar de quedar girando o bloqueado. Los cadáveres se
+siguen dibujando en gris pero no bloquean, para que el tablero no se sature con N alto. El choque contra
+obstáculo se mantiene como rebote, tal como describe el enunciado.
+
+Controles Iniciar / Pausar / Reanudar. La UI pasó de un único botón Action a dos: Iniciar, que arranca el
+reloj y lanza un hilo virtual por serpiente y queda deshabilitado después, y Pausar/Reanudar, habilitado solo
+una vez iniciada la partida. La barra espaciadora sigue funcionando y ya no puede desincronizarse del botón,
+porque ambos consultan el estado real del GameClock. Debajo del tablero se añadió una barra de estado donde se
+publican las estadísticas de la pausa.
+
+Consistencia de las estadísticas. El problema es que pausar no detiene a las serpientes de inmediato: una
+serpiente puede llevar hasta 80 ms dormida y despertar para completar su movimiento después de que la UI ya
+haya leído los datos. Para coordinarlo, el GameClock lleva la cuenta de cuántos trabajadores hay registrados,
+cuántos están efectivamente bloqueados en awaitIfPaused() y cuántos han terminado, y expone awaitAllPaused(),
+que espera a que todos estén bloqueados o terminados. Solo cuando esa barrera se cumple se piden las
+estadísticas al tablero. Estas se calculan con el lock del tablero tomado, así que ninguna serpiente puede
+estar a mitad de un step() mientras se leen: todas las longitudes corresponden al mismo instante lógico. El
+resultado se devuelve como un record inmutable, RaceStats, que se publica al EDT con invokeLater y no puede
+cambiar mientras se dibuja; por eso no hay tearing. La espera de la quiescencia se hace en un hilo auxiliar y
+no en el EDT, para no congelar la interfaz mientras dura, y tiene un timeout de dos segundos tras el cual la
+lectura se marca como parcial en vez de bloquearse indefinidamente.
+
+Verificación. Con 30 serpientes, la pausa se vuelve efectiva en unos 50 ms; las estadísticas leídas en ese
+momento y las releídas 900 ms después son idénticas, igual que las cabezas de las 30 serpientes, lo que
+confirma que nadie se movió después de la foto; el valor de la serpiente viva más larga coincide con el
+recálculo hecho por fuera; al reanudar todas vuelven a moverse; y al detener, todos los hilos terminan solos.
+
 ### 4) Robustez bajo carga
 
 - Ejecuta con **N alto** (`-Dsnakes=20` o más) y/o aumenta la velocidad.

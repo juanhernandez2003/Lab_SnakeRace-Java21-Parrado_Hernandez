@@ -5,6 +5,7 @@ import co.eci.snake.core.Board;
 import co.eci.snake.core.Direction;
 import co.eci.snake.core.GameState;
 import co.eci.snake.core.Position;
+import co.eci.snake.core.RaceStats;
 import co.eci.snake.core.Snake;
 import co.eci.snake.core.engine.GameClock;
 
@@ -24,7 +25,9 @@ import java.util.concurrent.Executors;
  * <p>Correcciones de concurrencia introducidas en este punto:</p>
  * <ul>
  *   <li><b>Sin fuga de {@code this}.</b> El constructor solo arma la ventana; los hilos y el reloj
- *       arrancan en {@link #start()}, cuando el objeto ya está completamente construido.</li>
+ *       arrancan desde el botón Iniciar, cuando el objeto ya está completamente construido.</li>
+ *   <li><b>Control Iniciar / Pausar / Reanudar</b> con estadísticas consistentes al pausar: se espera
+ *       a que la suspensión sea efectiva antes de leerlas, y se leen como una sola foto atómica.</li>
  *   <li><b>Estado en un solo lugar.</b> {@code togglePause()} consulta el estado real del
  *       {@link GameClock} en vez de deducirlo del texto del botón, que era una fuente de verdad
  *       ubicada en la vista y podía desincronizarse (botón vs. barra espaciadora).</li>
@@ -37,10 +40,18 @@ public final class SnakeApp extends JFrame {
 
   private final Board board;
   private final GamePanel gamePanel;
-  private final JButton actionButton;
+  private final JButton startButton;
+  private final JButton pauseButton;
+  private final JLabel statusLabel;
   private final GameClock clock;
   private final List<Snake> snakes;
   private final ExecutorService snakeExecutor = Executors.newVirtualThreadPerTaskExecutor();
+  /** Hilo auxiliar para esperar la quiescencia sin bloquear el EDT. */
+  private final ExecutorService uiWorker = Executors.newSingleThreadExecutor(r -> {
+    Thread t = new Thread(r, "ui-worker");
+    t.setDaemon(true);
+    return t;
+  });
 
   public SnakeApp() {
     super("The Snake Race");
@@ -52,24 +63,38 @@ public final class SnakeApp extends JFrame {
       int x = 2 + (i * 3) % board.width();
       int y = 2 + (i * 2) % board.height();
       var dir = Direction.values()[i % Direction.values().length];
-      built.add(Snake.of(x, y, dir));
+      built.add(Snake.of("Serpiente " + i, x, y, dir));
     }
     // Publicación segura: la lista queda inmutable antes de compartirse con el EDT y con los runners.
     this.snakes = List.copyOf(built);
+    board.register(this.snakes);
 
     this.gamePanel = new GamePanel(board, () -> snakes);
-    this.actionButton = new JButton("Pausar");
+    this.startButton = new JButton("Iniciar");
+    this.pauseButton = new JButton("Pausar");
+    this.pauseButton.setEnabled(false);
+    this.statusLabel = new JLabel("Listo. Pulsa Iniciar.");
+    this.statusLabel.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
     this.clock = new GameClock(60, () -> SwingUtilities.invokeLater(gamePanel::repaint));
+
+    var controls = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 4));
+    controls.add(startButton);
+    controls.add(pauseButton);
+
+    var south = new JPanel(new BorderLayout());
+    south.add(controls, BorderLayout.NORTH);
+    south.add(statusLabel, BorderLayout.SOUTH);
 
     setLayout(new BorderLayout());
     add(gamePanel, BorderLayout.CENTER);
-    add(actionButton, BorderLayout.SOUTH);
+    add(south, BorderLayout.SOUTH);
 
     setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
     pack();
     setLocationRelativeTo(null);
 
-    actionButton.addActionListener((ActionEvent e) -> togglePause());
+    startButton.addActionListener((ActionEvent e) -> startRace());
+    pauseButton.addActionListener((ActionEvent e) -> togglePause());
     bindKeys();
 
     addWindowListener(new WindowAdapter() {
@@ -77,25 +102,63 @@ public final class SnakeApp extends JFrame {
     });
   }
 
-  /** Arranca la simulación. Se invoca cuando el objeto ya está construido, para no publicar {@code this} a medias. */
-  public void start() {
+  /** Muestra la ventana. Se invoca cuando el objeto ya está construido, para no publicar {@code this} a medias. */
+  public void showUi() {
     setVisible(true);
+  }
+
+  /** Iniciar: arranca el reloj y lanza un hilo virtual por serpiente. Solo tiene efecto una vez. */
+  private void startRace() {
+    if (clock.state() != GameState.STOPPED) return;
+    clock.registerWorkers(snakes.size());
     clock.start();
     snakes.forEach(s -> snakeExecutor.submit(new SnakeRunner(s, board, clock)));
+    startButton.setEnabled(false);
+    pauseButton.setEnabled(true);
+    statusLabel.setText("En curso.");
   }
 
   private void shutdown() {
     clock.close();              // detiene el reloj y despierta a las serpientes bloqueadas
     snakeExecutor.shutdownNow();
+    uiWorker.shutdownNow();
   }
 
+  /**
+   * Pausar / Reanudar.
+   *
+   * <p>Al pausar no se leen las estadísticas de inmediato: la suspensión no es instantánea, así que
+   * un hilo auxiliar espera a que todas las serpientes estén efectivamente bloqueadas
+   * ({@code awaitAllPaused}) y solo entonces pide al tablero una foto coherente. El record resultante
+   * es inmutable y se publica en el EDT con {@code invokeLater}, de modo que lo que se muestra nunca
+   * queda a medias ni bloquea la interfaz mientras se espera.</p>
+   */
   private void togglePause() {
     if (clock.state() == GameState.RUNNING) {
       clock.pause();
-      actionButton.setText("Reanudar");
-    } else {
+      pauseButton.setEnabled(false);
+      statusLabel.setText("Pausando…");
+      uiWorker.submit(() -> {
+        boolean quiesced;
+        try {
+          quiesced = clock.awaitAllPaused(2000);
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          return;
+        }
+        RaceStats stats = board.stats();      // foto atómica bajo el lock del tablero
+        String prefix = quiesced ? "PAUSA — " : "PAUSA (parcial) — ";
+        SwingUtilities.invokeLater(() -> {
+          statusLabel.setText(prefix + stats.describe());
+          pauseButton.setText("Reanudar");
+          pauseButton.setEnabled(true);
+          gamePanel.repaint();                // último repintado con el mundo ya quieto
+        });
+      });
+    } else if (clock.state() == GameState.PAUSED) {
       clock.resume();
-      actionButton.setText("Pausar");
+      pauseButton.setText("Pausar");
+      statusLabel.setText("En curso.");
     }
   }
 
@@ -211,9 +274,11 @@ public final class SnakeApp extends JFrame {
       int idx = 0;
       for (Snake s : currentSnakes) {
         List<Position> body = s.snapshot();
+        boolean alive = s.isAlive();
         for (int i = 0; i < body.size(); i++) {
           var p = body.get(i);
-          Color base = (idx == 0) ? new Color(0, 170, 0) : new Color(0, 160, 180);
+          Color base = !alive ? new Color(140, 140, 140)
+              : (idx == 0) ? new Color(0, 170, 0) : new Color(0, 160, 180);
           int shade = Math.max(0, 40 - i * 4);
           g2.setColor(new Color(
               Math.min(255, base.getRed() + shade),
@@ -228,6 +293,6 @@ public final class SnakeApp extends JFrame {
   }
 
   public static void launch() {
-    SwingUtilities.invokeLater(() -> new SnakeApp().start());
+    SwingUtilities.invokeLater(() -> new SnakeApp().showUi());
   }
 }

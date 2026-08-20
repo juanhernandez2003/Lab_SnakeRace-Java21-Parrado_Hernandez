@@ -42,6 +42,11 @@ public final class GameClock implements AutoCloseable {
   private GameState state = GameState.STOPPED;   // guarded by monitor
   private ScheduledFuture<?> task;               // guarded by monitor
 
+  // Contabilidad de trabajadores, para saber cuándo la pausa se hizo efectiva de verdad.
+  private int workers;    // guarded by monitor
+  private int parked;     // guarded by monitor
+  private int finished;   // guarded by monitor
+
   public GameClock(long periodMillis, Runnable tick) {
     if (periodMillis <= 0) throw new IllegalArgumentException("periodMillis must be > 0");
     this.periodMillis = periodMillis;
@@ -102,10 +107,56 @@ public final class GameClock implements AutoCloseable {
    */
   public boolean awaitIfPaused() throws InterruptedException {
     synchronized (monitor) {
-      while (state == GameState.PAUSED) {
-        monitor.wait();
+      if (state == GameState.PAUSED) {
+        parked++;
+        monitor.notifyAll();          // avisa a quien esté esperando la quiescencia
+        try {
+          while (state == GameState.PAUSED) {
+            monitor.wait();
+          }
+        } finally {
+          parked--;
+        }
       }
       return state == GameState.RUNNING;
+    }
+  }
+
+  /** Declara cuántos hilos trabajadores van a suspenderse en {@link #awaitIfPaused()}. */
+  public void registerWorkers(int n) {
+    synchronized (monitor) {
+      workers += n;
+      monitor.notifyAll();
+    }
+  }
+
+  /** Un trabajador terminó (por muerte de su serpiente o por parada); ya no se le espera. */
+  public void workerFinished() {
+    synchronized (monitor) {
+      finished++;
+      monitor.notifyAll();
+    }
+  }
+
+  /**
+   * Espera a que la pausa sea <b>efectiva</b>: que todos los trabajadores estén bloqueados o hayan
+   * terminado. La suspensión no es instantánea (una serpiente puede llevar hasta 80 ms dormida), así
+   * que sin esta barrera las estadísticas se leerían mientras alguien todavía se mueve.
+   *
+   * <p>No debe invocarse desde el EDT: bloquea. En la UI se llama desde un hilo auxiliar y el
+   * resultado se publica con {@code invokeLater}.</p>
+   *
+   * @return {@code true} si se alcanzó la quiescencia dentro del tiempo dado
+   */
+  public boolean awaitAllPaused(long timeoutMillis) throws InterruptedException {
+    long deadline = System.nanoTime() + timeoutMillis * 1_000_000L;
+    synchronized (monitor) {
+      while (parked + finished < workers) {
+        long remainingMs = (deadline - System.nanoTime()) / 1_000_000L;
+        if (remainingMs <= 0) return false;
+        monitor.wait(remainingMs);
+      }
+      return true;
     }
   }
 
