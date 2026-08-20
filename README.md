@@ -87,6 +87,49 @@ La autonomía de cada serpiente consiste en que cada una tiene su propio ciclo y
 entre ellas. Un hilo de reloj (GameClock, ScheduledExecutorService de un hilo) dispara repaint() cada 60 ms 
 delegándolo al EDT.
 
+Posibles condiciones de carrera. La más grave está en Snake.body (un ArrayDeque): el hilo de la serpiente
+escribe con advance() mientras el EDT lee con snapshot() en cada repintado, sin ningún lock compartido, lo que
+produce ConcurrentModificationException y cuerpos inconsistentes. Que advance() se invoque dentro del step()
+sincronizado no protege nada, porque snapshot() no toma ese monitor. Snake.turn() es un check-then-act sobre
+direction, escrito a la vez por el EDT (teclas) y por el propio runner (randomTurn): volatile garantiza
+visibilidad pero no atomicidad, así que dos giros entrelazados pueden romper la invariante de no ir en reversa.
+maxLength es un int sin volatile ni lock, sin garantía de visibilidad entre hilos. Board.step() lee head() y
+direction() en secuencia, y el EDT puede cambiar la dirección entre ambas lecturas porque no participa del lock.
+paintComponent() combina cinco lecturas independientes del mundo (mice, obstacles, turbo, teleports y el
+snapshot de cada serpiente) tomadas en instantes distintos, lo que produce tearing. En GameClock, stop() no
+cancela el ScheduledFuture, de modo que un start() posterior programa una segunda tarea periódica, y
+togglePause() deriva el estado del texto del botón en lugar del estado real del reloj. Por último, SnakeApp
+lanza los hilos, llama a clock.start() y hace setVisible(true) dentro de su propio constructor, publicando el
+objeto antes de terminar de construirse. En contraste, el consumo de ratones y turbos sí está bien resuelto:
+mice.remove(next) y turbo.remove(next) son check-and-act atómicos bajo el lock del tablero, por lo que dos
+serpientes no pueden comer el mismo ratón.
+
+Colecciones no seguras. Snake.body es un ArrayDeque compartido entre el hilo de la serpiente y el EDT sin
+protección alguna: es el caso crítico. Los HashSet y el HashMap de Board (mice, obstacles, turbo y teleports)
+sí quedan cubiertos, porque todos los accesos públicos son synchronized y los getters devuelven copias
+defensivas, pero al precio de copiar las estructuras completas dentro del lock en cada frame. SnakeApp.snakes
+es un ArrayList sin barrera de memoria explícita: hoy solo se lee después de construirse, pero cualquier alta o
+baja de serpientes en ejecución provocaría ConcurrentModificationException. Las sustituciones razonables son
+ConcurrentHashMap.newKeySet() y ConcurrentHashMap para el estado del tablero, y un snapshot inmutable publicado
+atómicamente en lugar de exponer el Deque vivo de la serpiente.
+
+Espera activa y sincronización innecesaria. GameClock mantiene la tarea periódica activa durante la pausa y en
+cada tick comprueba si el estado es RUNNING para no hacer nada: es polling del estado, con ticks vacíos
+indefinidos. Lo correcto es cancelar el ScheduledFuture al pausar y reprogramarlo al reanudar, o bloquear con
+wait/notifyAll o con un Condition. El Thread.sleep() del SnakeRunner no es espera activa, pues libera la CPU,
+pero es un temporizador rígido que no ofrece ningún mecanismo de pausa; resolverlo con un while (paused) {}
+dentro del bucle sí introduciría busy-wait. En cuanto a la sincronización, Board usa un único lock global (this)
+para step() y para los cuatro getters, lo que serializa por completo la simulación —con -Dsnakes=20 solo una
+serpiente avanza a la vez aunque estén en extremos opuestos del tablero— y hace que el EDT compita por ese mismo
+monitor en cada repintado. El diagnóstico de fondo es que la sincronización está en el lugar equivocado:
+demasiado gruesa donde no hace falta, en las lecturas del render, e inexistente donde sí hace falta, en Snake.
+A esto se suma copiar las colecciones dentro del lock y clonar cada serpiente completa en cada frame.
+
+Snake.body (ArrayDeque): El hilo de la serpiente escribe (advance → addFirst/removeLast) mientras el EDT lee 
+(snapshot() → new ArrayDeque<>(body)) en cada frame. Sin ninguna sincronización compartida → ConcurrentModificationException, 
+NoSuchElementException o cuerpos "a medias". Hay que tener en cuenta el argumento fácil: advance se llama dentro de Board.step,
+que es synchronized, pero snapshot() no toma ese monitor, así que el lock no protege nada aquí. Es el data race más
+grave y el que revienta con -Dsnakes=20.
 ### 2) Correcciones mínimas y regiones críticas
 
 - **Elimina** esperas activas reemplazándolas por **señales** / **estados** o mecanismos de la librería de concurrencia.
