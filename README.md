@@ -66,6 +66,24 @@ co.eci.snake
 
 > Objetivo didáctico: practicar suspensión/continuación **sin** espera activa y consolidar el modelo de monitores en Java.
 
+### Solución y observaciones (Parte I)
+
+La solución vive en el repositorio [`wait-notify-excercise-ParradoHernandez`](https://github.com/juanhernandez2003/wait-notify-excercise-ParradoHernandez), rama `feature/parte1`: se agregó la clase `PauseMonitor` y se modificaron `PrimeFinderThread` y `Control`.
+
+**Qué lock se usa.** Se introdujo la clase `PauseMonitor`, que actúa como el *único* monitor del programa: tanto los hilos trabajadores (`PrimeFinderThread`) como el hilo controlador (`Control`) sincronizan sobre esa misma instancia. Todo el estado compartido de la pausa vive dentro de ella —la bandera `paused`, el contador `pausedWorkers` de hilos efectivamente suspendidos y `liveWorkers` de hilos que aún no terminan su rango—, de modo que es imposible leer o escribir ese estado fuera del lock, que es la causa habitual de las condiciones de carrera en este tipo de ejercicios.
+
+**Cuál es la condición.** Cada trabajador invoca `checkPause()` en cada iteración de su ciclo. Si `paused` está activa, el hilo entra al bloque `synchronized`, incrementa `pausedWorkers`, hace `notifyAll()` para avisarle al controlador que ya se detuvo y se bloquea en `while (paused) wait();`. La espera está siempre dentro de un `while` y no de un `if`, de manera que ante *spurious wakeups* o ante un `notifyAll()` dirigido a otra condición el hilo vuelve a evaluar el predicado antes de continuar. No hay espera activa: un hilo pausado queda en estado `WAITING` sobre el monitor y consume 0% de CPU.
+
+**Cómo se evitan los *lost wakeups*.** Por tres decisiones concretas. Primera, la reanudación no depende de una señal "de flanco" sino del valor de `paused`: si un trabajador llega tarde al punto de chequeo encuentra la bandera en falso y simplemente sigue, sin quedarse dormido por una notificación que ya pasó. Segunda, `resumeAll()` pone `paused = false` **y** hace `notifyAll()` dentro del mismo bloque `synchronized`, así que ningún hilo puede colarse entre el cambio de la bandera y la notificación, porque para llegar a `wait()` primero debe adquirir ese mismo lock. Tercera, se usa `notifyAll()` y no `notify()`, porque en este monitor esperan hilos por dos condiciones distintas —los trabajadores por que se levante la pausa y el controlador por que todos estén pausados— y despertar al hilo equivocado perdería la señal para el resto.
+
+**Consistencia del conteo.** El controlador no imprime el número de primos justo después de activar la bandera, sino que llama `awaitAllPaused()`, que espera con `wait()` hasta que `pausedWorkers == liveWorkers`. Así la cifra reportada corresponde a un estado estable y no a una foto tomada mientras los hilos siguen agregando resultados. Como contraparte, `workerFinished()` decrementa `liveWorkers` cuando un hilo agota su rango; sin eso el controlador esperaría indefinidamente por hilos que ya murieron, un interbloqueo sutil que aparece justo al final de la ejecución.
+
+**Costo de sincronizar en cada iteración.** El punto de chequeo se ejecuta 30 millones de veces, así que `checkPause()` tiene un *camino rápido*: lee la bandera `paused`, declarada `volatile`, **sin** tomar el lock, y solo entra al bloque `synchronized` si hay una pausa pendiente. El costo normal por iteración es entonces una lectura volátil en lugar de una adquisición de monitor con contención entre tres hilos. Esto no es espera activa —el hilo no gira esperando nada, avanza haciendo trabajo útil— y no compromete la corrección: si la bandera se activa justo después de la lectura, el hilo se detiene en la iteración siguiente y el controlador lo espera en `awaitAllPaused()`. Dentro del bloque se reevalúa `paused` (patrón *double-checked*), correcto aquí precisamente porque la variable es `volatile`.
+
+**Detalle adicional.** La lista `primes` de cada trabajador se protege con métodos `synchronized` sobre el propio hilo (`addPrime`, `getPrimeCount`). Aunque durante la pausa los trabajadores están congelados y la lectura sería segura, hacerlo explícito evita depender de esa suposición y garantiza la visibilidad de memoria entre el hilo que escribe y el controlador que lee.
+
+**Verificación.** Con `NTHREADS = 3` y `MAXVALUE = 30000000` el programa se pausa cada _t_ ms, reporta el conteo acumulado, reanuda con ENTER y termina reportando 1.857.859 primos, que es el valor correcto de π(3·10⁷).
+
 ---
 
 ## Parte II — SnakeRace concurrente (núcleo del laboratorio)
